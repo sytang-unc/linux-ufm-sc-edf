@@ -319,6 +319,9 @@ struct dl_bw {
 	raw_spinlock_t		lock;
 	u64			bw;
 	u64			total_bw;
+	u64			big_bw;
+	u64			little_bw;
+	u64			global_b_bw;
 };
 
 extern void init_dl_bw(struct dl_bw *dl_b);
@@ -717,6 +720,9 @@ struct dl_rq {
 	struct {
 		u64		curr;
 		u64		next;
+		//uscedf
+		int		curr_is_global;
+		u64		next_global;
 	} earliest_dl;
 
 	unsigned int		dl_nr_migratory;
@@ -728,9 +734,18 @@ struct dl_rq {
 	 * of the leftmost (earliest deadline) element.
 	 */
 	struct rb_root_cached	pushable_dl_tasks_root;
+	//uscedf
+	struct rb_root_cached	global_dl_tasks_root;
+
+	struct hrtimer		wdl_timer;
+	
+	//used for wdl preemption
+	int			dest_cpu;
+	struct task_struct	*wdl_task;
 #else
 	struct dl_bw		dl_bw;
 #endif
+
 	/*
 	 * "Active utilization" for this runqueue: increased when a
 	 * task wakes up (becomes TASK_RUNNING) and decreased when a
@@ -811,6 +826,8 @@ struct perf_domain {
 #define SG_OVERLOAD		0x1 /* More than one runnable task on a CPU. */
 #define SG_OVERUTILIZED		0x2 /* One or more CPUs are over-utilized. */
 
+#define RD_CPUS_STRLEN		10
+
 /*
  * We add the notion of a root-domain which will be used to define per-domain
  * variables. Each exclusive cpuset essentially defines an island domain by
@@ -825,6 +842,20 @@ struct root_domain {
 	struct rcu_head		rcu;
 	cpumask_var_t		span;
 	cpumask_var_t		online;
+
+	//uscedf, maintained in rq_attach_root
+	cpumask_var_t	big_span;
+	cpumask_var_t	little_span;
+	char		big_span_str[RD_CPUS_STRLEN];
+	char		*big_span_ptr;
+	char		little_span_str[RD_CPUS_STRLEN];
+	char		*little_span_ptr;
+	//maintained in rq_on/offline_dl
+	cpumask_var_t	big_online;
+	cpumask_var_t	little_online;
+	//maintained in rq_attach_root
+	unsigned int	num_big;
+	unsigned int	num_little;
 
 	/*
 	 * Indicate pullable load on at least one CPU, e.g:
@@ -843,7 +874,25 @@ struct root_domain {
 	cpumask_var_t		dlo_mask;
 	atomic_t		dlo_count;
 	struct dl_bw		dl_bw;
-	struct cpudl		cpudl;
+	//struct cpudl		cpudl;
+	//uscedf
+	//maintained in update_edl_curr -> update_bl_deadline
+	u64			big_deadline;
+	int			big_deadline_cpu;
+	u64			little_deadline;
+	int			little_deadline_cpu;
+	//maintained in update_edl_next
+	u64			big_next;
+	u64			little_next;
+	//TODO
+	u64			max_dl_period;
+	unsigned int		two_cpus_push_busy;
+	struct cpu_stop_work	two_cpus_push_work_1;
+	struct cpu_stop_work	two_cpus_push_work_2;
+	struct multi_stop_data	dl_msdata;
+	struct task_struct	*swap_task;
+	unsigned int		dest_cpu;
+	raw_spinlock_t		dl_bl_lock;
 
 	/*
 	 * Indicate whether a root_domain's dl_bw has been checked or
@@ -875,6 +924,8 @@ struct root_domain {
 	struct cpupri		cpupri;
 
 	unsigned long		max_cpu_capacity;
+	//uscedf, maintained in rq_attach_root
+	unsigned long		min_cpu_capacity;
 
 	/*
 	 * NULL-terminated list of performance domains intersecting with the
@@ -888,6 +939,11 @@ extern int sched_init_domains(const struct cpumask *cpu_map);
 extern void rq_attach_root(struct rq *rq, struct root_domain *rd);
 extern void sched_get_rd(struct root_domain *rd);
 extern void sched_put_rd(struct root_domain *rd);
+
+static inline int cpu_is_big(int cpu)
+{
+	return arch_scale_cpu_capacity(cpu) == SCHED_CAPACITY_SCALE;
+}
 
 #ifdef HAVE_RT_PUSH_IPI
 extern void rto_push_irq_work_func(struct irq_work *work);

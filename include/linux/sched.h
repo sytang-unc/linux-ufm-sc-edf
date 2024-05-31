@@ -598,6 +598,11 @@ struct sched_rt_entity {
 #endif
 } __randomize_layout;
 
+//uscedf
+#define DL_AFF_GLOBAL	0
+#define DL_AFF_BIG	1
+#define DL_AFF_LITTLE	2
+
 struct sched_dl_entity {
 	struct rb_node			rb_node;
 
@@ -865,6 +870,8 @@ struct task_struct {
 #ifdef CONFIG_SMP
 	struct plist_node		pushable_tasks;
 	struct rb_node			pushable_dl_tasks;
+	//uscedf
+	struct rb_node			global_dl_tasks;
 #endif
 
 	struct mm_struct		*mm;

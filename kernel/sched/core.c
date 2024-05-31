@@ -4654,6 +4654,7 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 #ifdef CONFIG_SMP
 	plist_node_init(&p->pushable_tasks, MAX_PRIO);
 	RB_CLEAR_NODE(&p->pushable_dl_tasks);
+	RB_CLEAR_NODE(&p->global_dl_tasks);
 #endif
 	return 0;
 }
@@ -7599,8 +7600,14 @@ change:
 			 * the entire root_domain to become SCHED_DEADLINE. We
 			 * will also fail if there's no bandwidth available.
 			 */
-			if (!cpumask_subset(span, p->cpus_ptr) ||
-			    rq->rd->dl_bw.bw == 0) {
+			//uscedf, allow instances where affinity is is only big or LITTLE CPUs
+			//Note we need cpumask_equal when comparing against big or LITTLE, can cheat with subset for span
+			// because we know we won't get migrated out the root domain, so having extra CPUs outside of span
+			// doesn't do anything
+			if ((!cpumask_subset(span, p->cpus_ptr) &&
+				!cpumask_equal(rq->rd->big_span, p->cpus_ptr) &&
+				!cpumask_equal(rq->rd->little_span, p->cpus_ptr)) ||
+				rq->rd->dl_bw.bw == 0) {
 				retval = -EPERM;
 				goto unlock;
 			}
@@ -8127,7 +8134,7 @@ out_unlock:
 #ifdef CONFIG_SMP
 int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
 {
-	int ret = 0;
+	//int ret = 0;
 
 	/*
 	 * If the task isn't a deadline task or admission control is
@@ -8142,11 +8149,14 @@ int dl_task_check_affinity(struct task_struct *p, const struct cpumask *mask)
 	 * tasks allowed to run on all the CPUs in the task's
 	 * root_domain.
 	 */
-	rcu_read_lock();
-	if (!cpumask_subset(task_rq(p)->rd->span, mask))
-		ret = -EBUSY;
-	rcu_read_unlock();
-	return ret;
+	//rcu_read_lock();
+	//if (!cpumask_subset(task_rq(p)->rd->span, mask))
+	//	ret = -EBUSY;
+	//rcu_read_unlock();
+	//return ret;
+
+	//uscedf, don't allow DL tasks to change affinity
+	return 1;
 }
 #endif
 
@@ -9102,6 +9112,10 @@ int task_can_attach(struct task_struct *p)
 	 */
 	if (p->flags & PF_NO_SETAFFINITY)
 		ret = -EINVAL;
+
+	//uscedf, don't allow tasks to attach to new root_domains because this dynamically changes affinity
+	if (dl_task(p))
+		ret = -EPERM;
 
 	return ret;
 }

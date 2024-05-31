@@ -473,11 +473,15 @@ static void free_rootdomain(struct rcu_head *rcu)
 	struct root_domain *rd = container_of(rcu, struct root_domain, rcu);
 
 	cpupri_cleanup(&rd->cpupri);
-	cpudl_cleanup(&rd->cpudl);
+	//cpudl_cleanup(&rd->cpudl);
+	free_cpumask_var(rd->little_online);
+	free_cpumask_var(rd->big_online);
 	free_cpumask_var(rd->dlo_mask);
 	free_cpumask_var(rd->rto_mask);
 	free_cpumask_var(rd->online);
 	free_cpumask_var(rd->span);
+	free_cpumask_var(rd->big_span);
+	free_cpumask_var(rd->little_span);
 	free_pd(rd->pd);
 	kfree(rd);
 }
@@ -486,6 +490,9 @@ void rq_attach_root(struct rq *rq, struct root_domain *rd)
 {
 	struct root_domain *old_rd = NULL;
 	unsigned long flags;
+	unsigned int cpu;
+	unsigned long min_cap = SCHED_CAPACITY_SCALE;
+	unsigned long this_cap = arch_scale_cpu_capacity(rq->cpu);
 
 	raw_spin_rq_lock_irqsave(rq, flags);
 
@@ -495,7 +502,27 @@ void rq_attach_root(struct rq *rq, struct root_domain *rd)
 		if (cpumask_test_cpu(rq->cpu, old_rd->online))
 			set_rq_offline(rq);
 
+		raw_spin_lock(&old_rd->dl_bl_lock);
+		if (cpu_is_big(rq->cpu)) {
+			cpumask_clear_cpu(rq->cpu, old_rd->big_span);
+			old_rd->num_big = cpumask_weight(old_rd->big_span);
+			snprintf(old_rd->big_span_str, RD_CPUS_STRLEN, "%*pbl", cpumask_pr_args(old_rd->big_span));
+		}
+		else {
+			cpumask_clear_cpu(rq->cpu, old_rd->little_span);
+			old_rd->num_little = cpumask_weight(old_rd->little_span);
+			snprintf(old_rd->little_span_str, RD_CPUS_STRLEN, "%*pbl", cpumask_pr_args(old_rd->little_span));
+		}
+
 		cpumask_clear_cpu(rq->cpu, old_rd->span);
+		for_each_cpu(cpu, old_rd->span) {
+			unsigned long cpu_cap = arch_scale_cpu_capacity(cpu);
+			if (min_cap > cpu_cap)
+				min_cap = cpu_cap;
+		}
+		old_rd->min_cpu_capacity = min_cap;
+
+		raw_spin_unlock(&old_rd->dl_bl_lock);
 
 		/*
 		 * If we dont want to free the old_rd yet then
@@ -510,8 +537,27 @@ void rq_attach_root(struct rq *rq, struct root_domain *rd)
 	rq->rd = rd;
 
 	cpumask_set_cpu(rq->cpu, rd->span);
+	
+	if (this_cap < rd->min_cpu_capacity)
+		rd->min_cpu_capacity = this_cap;
+
 	if (cpumask_test_cpu(rq->cpu, cpu_active_mask))
 		set_rq_online(rq);
+
+	raw_spin_lock(&rd->dl_bl_lock);
+
+	if (cpu_is_big(rq->cpu)) {
+		cpumask_set_cpu(rq->cpu, rd->big_span);
+		rd->num_big = cpumask_weight(rd->big_span);
+		snprintf(rd->big_span_str, RD_CPUS_STRLEN, "%*pbl", cpumask_pr_args(rd->big_span));
+	}
+	else {
+		cpumask_set_cpu(rq->cpu, rd->little_span);
+		rd->num_little = cpumask_weight(rd->little_span);
+		snprintf(rd->little_span_str, RD_CPUS_STRLEN, "%*pbl", cpumask_pr_args(rd->little_span));
+	}
+
+	raw_spin_unlock(&rd->dl_bl_lock);
 
 	raw_spin_rq_unlock_irqrestore(rq, flags);
 
@@ -542,6 +588,14 @@ static int init_rootdomain(struct root_domain *rd)
 		goto free_online;
 	if (!zalloc_cpumask_var(&rd->rto_mask, GFP_KERNEL))
 		goto free_dlo_mask;
+	if (!zalloc_cpumask_var(&rd->big_online, GFP_KERNEL))
+		goto free_rto_mask;
+	if (!zalloc_cpumask_var(&rd->little_online, GFP_KERNEL))
+		goto free_big_online;
+	if (!zalloc_cpumask_var(&rd->big_span, GFP_KERNEL))
+		goto free_little_online;
+	if (!zalloc_cpumask_var(&rd->little_span, GFP_KERNEL))
+		goto free_big_span;
 
 #ifdef HAVE_RT_PUSH_IPI
 	rd->rto_cpu = -1;
@@ -551,15 +605,29 @@ static int init_rootdomain(struct root_domain *rd)
 
 	rd->visit_gen = 0;
 	init_dl_bw(&rd->dl_bw);
-	if (cpudl_init(&rd->cpudl) != 0)
-		goto free_rto_mask;
+	//if (cpudl_init(&rd->cpudl) != 0)
+	//	goto free_rto_mask;
+	raw_spin_lock_init(&rd->dl_bl_lock);
+	rd->min_cpu_capacity = SCHED_CAPACITY_SCALE;
+	rd->big_deadline_cpu = rd->little_deadline_cpu = -1;
+
+	rd->big_span_ptr = &rd->big_span_str[0];
+	rd->little_span_ptr = &rd->little_span_str[0];
 
 	if (cpupri_init(&rd->cpupri) != 0)
-		goto free_cpudl;
+		goto free_little_span;
 	return 0;
 
-free_cpudl:
-	cpudl_cleanup(&rd->cpudl);
+free_little_span:
+	free_cpumask_var(rd->little_span);
+free_big_span:
+	free_cpumask_var(rd->big_span);
+free_little_online:
+	free_cpumask_var(rd->little_online);
+free_big_online:
+	free_cpumask_var(rd->big_online);
+//free_cpudl:
+//	cpudl_cleanup(&rd->cpudl);
 free_rto_mask:
 	free_cpumask_var(rd->rto_mask);
 free_dlo_mask:

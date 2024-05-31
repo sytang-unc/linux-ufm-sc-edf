@@ -2546,32 +2546,33 @@ static int cpuset_can_attach(struct cgroup_taskset *tset)
 		if (ret)
 			goto out_unlock;
 
-		if (dl_task(task)) {
-			cs->nr_migrate_dl_tasks++;
-			cs->sum_migrate_dl_bw += task->dl.dl_bw;
-		}
+		//uscedf, dl tasks should always fail task_can_attach
+		//if (dl_task(task)) {
+		//	cs->nr_migrate_dl_tasks++;
+		//	cs->sum_migrate_dl_bw += task->dl.dl_bw;
+		//}
 	}
 
-	if (!cs->nr_migrate_dl_tasks)
-		goto out_success;
+	//if (!cs->nr_migrate_dl_tasks)
+	//	goto out_success;
 
-	if (!cpumask_intersects(oldcs->effective_cpus, cs->effective_cpus)) {
-		int cpu = cpumask_any_and(cpu_active_mask, cs->effective_cpus);
+	//if (!cpumask_intersects(oldcs->effective_cpus, cs->effective_cpus)) {
+	//	int cpu = cpumask_any_and(cpu_active_mask, cs->effective_cpus);
 
-		if (unlikely(cpu >= nr_cpu_ids)) {
-			reset_migrate_dl_data(cs);
-			ret = -EINVAL;
-			goto out_unlock;
-		}
+	//	if (unlikely(cpu >= nr_cpu_ids)) {
+	//		reset_migrate_dl_data(cs);
+	//		ret = -EINVAL;
+	//		goto out_unlock;
+	//	}
 
-		ret = dl_bw_alloc(cpu, cs->sum_migrate_dl_bw);
-		if (ret) {
-			reset_migrate_dl_data(cs);
-			goto out_unlock;
-		}
-	}
+	//	ret = dl_bw_alloc(cpu, cs->sum_migrate_dl_bw);
+	//	if (ret) {
+	//		reset_migrate_dl_data(cs);
+	//		goto out_unlock;
+	//	}
+	//}
 
-out_success:
+//out_success:
 	/*
 	 * Mark attach is in progress.  This makes validate_change() fail
 	 * changes which zero cpus/mems_allowed.
@@ -2595,12 +2596,12 @@ static void cpuset_cancel_attach(struct cgroup_taskset *tset)
 	if (!cs->attach_in_progress)
 		wake_up(&cpuset_attach_wq);
 
-	if (cs->nr_migrate_dl_tasks) {
-		int cpu = cpumask_any(cs->effective_cpus);
+	//if (cs->nr_migrate_dl_tasks) {
+	//	int cpu = cpumask_any(cs->effective_cpus);
 
-		dl_bw_free(cpu, cs->sum_migrate_dl_bw);
-		reset_migrate_dl_data(cs);
-	}
+	//	dl_bw_free(cpu, cs->sum_migrate_dl_bw);
+	//	reset_migrate_dl_data(cs);
+	//}
 
 	mutex_unlock(&cpuset_mutex);
 }

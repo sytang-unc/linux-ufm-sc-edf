@@ -153,31 +153,6 @@ int stop_one_cpu(unsigned int cpu, cpu_stop_fn_t fn, void *arg)
 	return done.ret;
 }
 
-/* This controls the threads on each CPU. */
-enum multi_stop_state {
-	/* Dummy starting state for thread. */
-	MULTI_STOP_NONE,
-	/* Awaiting everyone to be scheduled. */
-	MULTI_STOP_PREPARE,
-	/* Disable interrupts. */
-	MULTI_STOP_DISABLE_IRQ,
-	/* Run the function */
-	MULTI_STOP_RUN,
-	/* Exit */
-	MULTI_STOP_EXIT,
-};
-
-struct multi_stop_data {
-	cpu_stop_fn_t		fn;
-	void			*data;
-	/* Like num_online_cpus(), but hotplug cpu uses us, so we need this. */
-	unsigned int		num_threads;
-	const struct cpumask	*active_cpus;
-
-	enum multi_stop_state	state;
-	atomic_t		thread_ack;
-};
-
 static void set_state(struct multi_stop_data *msdata,
 		      enum multi_stop_state newstate)
 {
@@ -265,6 +240,7 @@ static int cpu_stop_queue_two_works(int cpu1, struct cpu_stop_work *work1,
 	struct cpu_stopper *stopper2 = per_cpu_ptr(&cpu_stopper, cpu2);
 	DEFINE_WAKE_Q(wakeq);
 	int err;
+	unsigned long flags;
 
 retry:
 	/*
@@ -275,7 +251,7 @@ retry:
 	 * stopper forever.
 	 */
 	preempt_disable();
-	raw_spin_lock_irq(&stopper1->lock);
+	raw_spin_lock_irqsave(&stopper1->lock, flags);
 	raw_spin_lock_nested(&stopper2->lock, SINGLE_DEPTH_NESTING);
 
 	if (!stopper1->enabled || !stopper2->enabled) {
@@ -304,7 +280,7 @@ retry:
 
 unlock:
 	raw_spin_unlock(&stopper2->lock);
-	raw_spin_unlock_irq(&stopper1->lock);
+	raw_spin_unlock_irqrestore(&stopper1->lock, flags);
 
 	if (unlikely(err == -EDEADLK)) {
 		preempt_enable();
@@ -361,6 +337,31 @@ int stop_two_cpus(unsigned int cpu1, unsigned int cpu2, cpu_stop_fn_t fn, void *
 
 	wait_for_completion(&done.completion);
 	return done.ret;
+}
+
+bool stop_two_cpus_nowait(unsigned int cpu1, unsigned int cpu2, 
+				cpu_stop_fn_t fn, void *arg,
+				struct cpu_stop_work *buf1, struct cpu_stop_work *buf2, 
+				struct multi_stop_data *msdata)
+{
+	int queued_err;
+	*msdata = (struct multi_stop_data){
+		.fn = fn,
+		.data = arg,
+		.num_threads = 2,
+		.active_cpus = cpumask_of(cpu1),
+	};
+	*buf1 = *buf2 = (struct cpu_stop_work){
+		.fn = multi_cpu_stop,
+		.arg = msdata,
+		.caller = _RET_IP_,
+	};
+
+	set_state(msdata, MULTI_STOP_PREPARE);
+	if (cpu1 > cpu2)
+		swap(cpu1, cpu2);
+	queued_err = cpu_stop_queue_two_works(cpu1, buf1, cpu2, buf2);
+	return !queued_err;
 }
 
 /**

@@ -391,6 +391,21 @@ static void register_sd(struct sched_domain *sd, struct dentry *parent)
 	debugfs_create_file("flags", 0444, parent, &sd->flags, &sd_flags_fops);
 }
 
+static struct dentry		*rd_dentry;
+static u64			debug_dl_generation;
+
+void register_rd(struct root_domain *rd, struct dentry *parent)
+{
+	debugfs_create_str("big_span", 0400, parent, &rd->big_span_ptr);
+	debugfs_create_str("little_span", 0400, parent, &rd->little_span_ptr);
+	debugfs_create_ulong("min_cpu_capacity", 0400, parent, &rd->min_cpu_capacity);
+	debugfs_create_u64("max_dl_period", 0400, parent, &rd->max_dl_period);
+	debugfs_create_u64("total_bw", 0400, parent, &rd->dl_bw.total_bw);
+	debugfs_create_u64("big_bw", 0400, parent, &rd->dl_bw.big_bw);
+	debugfs_create_u64("little_bw", 0400, parent, &rd->dl_bw.little_bw);
+	debugfs_create_u64("global_b_bw", 0400, parent, &rd->dl_bw.global_b_bw);
+}
+
 void update_sched_domain_debugfs(void)
 {
 	int cpu, i;
@@ -432,6 +447,34 @@ void update_sched_domain_debugfs(void)
 		}
 
 		__cpumask_clear_cpu(cpu, sd_sysctl_cpus);
+	}
+
+	//The following is for personal use and totally ignores synchronization
+
+	if (!rd_dentry)
+		rd_dentry = debugfs_create_dir("root_domains", debugfs_sched);
+	
+	for (i = 0; i < cpumask_weight(cpu_possible_mask); i++) {
+		char buf[32];
+		snprintf(buf, sizeof(buf), "rd%d", i);
+		debugfs_lookup_and_remove(buf, rd_dentry);
+	}
+
+	debug_dl_generation++;
+	i = 0;
+	for_each_cpu(cpu, cpu_active_mask) {
+		char buf[32];
+		struct root_domain *rd = cpu_rq(cpu)->rd;
+		struct dentry *d_rd;
+
+		if (rd->visit_gen == debug_dl_generation)
+			continue;
+
+		snprintf(buf, sizeof(buf), "rd%d", i);
+		i++;
+		d_rd = debugfs_create_dir(buf, rd_dentry);
+		register_rd(rd, d_rd);	
+		rd->visit_gen = debug_dl_generation;
 	}
 }
 
