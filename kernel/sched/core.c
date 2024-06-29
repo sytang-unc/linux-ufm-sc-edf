@@ -7608,6 +7608,7 @@ change:
 				!cpumask_equal(rq->rd->big_span, p->cpus_ptr) &&
 				!cpumask_equal(rq->rd->little_span, p->cpus_ptr)) ||
 				rq->rd->dl_bw.bw == 0) {
+				printk(KERN_INFO "Rejected SCHED_DEADLINE task due to affinity\n");
 				retval = -EPERM;
 				goto unlock;
 			}

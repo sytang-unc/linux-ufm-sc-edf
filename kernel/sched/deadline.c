@@ -20,6 +20,7 @@
 
 #define CREATE_TRACE_POINTS
 #include<trace/events/uscedf.h>
+#include<trace/events/uscedf_debug.h>
 
 /*
  * Default limits for DL period; on the top end we guard against small util
@@ -293,15 +294,20 @@ static inline void __dl_sub_bws(struct dl_bw *dl_b, struct task_bw_delta *sub, i
 }
 
 static inline
-void __dl_add(struct dl_bw *dl_b, u64 tsk_bw, int cpus)
+void __dl_add(struct dl_bw *dl_b, u64 tsk_bw, int cpus, u64 period)
 {
+	struct root_domain *rd;
+	rd = container_of(dl_b, struct root_domain, dl_bw);
+	if (period > rd->max_dl_period)
+		rd->max_dl_period = period;
+
 	dl_b->total_bw += tsk_bw;
 	__dl_update(dl_b, -((s32)tsk_bw / cpus));
 }
 
-static inline void __dl_add_bws(struct dl_bw *dl_b, struct task_bw_delta *add, int cpus)
+static inline void __dl_add_bws(struct dl_bw *dl_b, struct task_bw_delta *add, int cpus, u64 period)
 {
-	__dl_add(dl_b, add->bw, cpus);
+	__dl_add(dl_b, add->bw, cpus, period);
 	dl_b->big_bw += add->big;
 	dl_b->little_bw += add->little;
 	dl_b->global_b_bw += add->global_b;
@@ -316,6 +322,7 @@ __dl_overflow(struct root_domain *rd, struct task_bw_delta *change)
 	unsigned long total_big_cap, total_little_cap, total_cap;
 	struct task_bw_delta def_change;
 	struct dl_bw *dl_b = &rd->dl_bw;
+	bool ret = 0;
 	if (dl_b->bw == -1)
 		return false;
 	
@@ -325,10 +332,21 @@ __dl_overflow(struct root_domain *rd, struct task_bw_delta *change)
 	total_cap = total_big_cap + total_little_cap;
 	if (!change)
 		change = &def_change;
+	
+	if (cap_scale(dl_b->bw, total_cap) < dl_b->total_bw + change->bw) {
+		printk(KERN_INFO "Rejected SCHED_DEADLINE task due to total capacity overflow: total_bw is %llu, added_total is %lld\n", dl_b->total_bw, change->bw);
+		ret = 1;
+	}
+	if (cap_scale(dl_b->bw, total_little_cap) < dl_b->little_bw + change->little) {
+		printk(KERN_INFO "Rejected SCHED_DEADLINE task due to LITTLE capacity overflow: little_bw is %llu, added_little is %lld\n", dl_b->little_bw, change->little);
+		ret = 1;
+	}
+	if (cap_scale(dl_b->bw, total_big_cap) < dl_b->big_bw + dl_b->global_b_bw + change->big + change->global_b) {
+		printk(KERN_INFO "Rejected SCHED_DEADLINE task due to big capacity overflow: big_bw is %llu, global_b_bw is %llu, added_big is %lld, added_global_b is %lld\n", dl_b->big_bw, dl_b->global_b_bw, change->big, change->global_b);
+		ret = 1;
+	}
 
-	return cap_scale(dl_b->bw, total_cap) < dl_b->total_bw + change->bw &&
-	       cap_scale(dl_b->bw, total_little_cap) < dl_b->little_bw + change->little &&
-	       cap_scale(dl_b->bw, total_big_cap) < dl_b->big_bw + dl_b->global_b_bw + change->big + change->global_b;
+	return ret;
 }
 
 static void __bw_change(struct task_struct *p, struct task_bw_delta *old, struct task_bw_delta *new, struct task_bw_delta *change) {
@@ -701,10 +719,14 @@ static bool check_wdl_preempt(struct rq *rq, struct task_struct *p, int *cpu)
 	trace_uscedf_wdl_check_start(rq);
 
 	u64 wdl = get_wdl(rq, cpu);
-	if (cpu_is_big(rq->cpu))
+	if (cpu_is_big(rq->cpu)) {
 		ret = dl_time_before(get_big_next(rq), wdl);
-	else
+		trace_uscedf_debug_wdl_compare(rq->cpu, wdl, p->dl.deadline, get_little_deadline(rq, NULL), get_big_next(rq), rq->rd->big_next);
+	}
+	else {
 		ret = dl_time_before(get_little_next(rq), wdl);
+		trace_uscedf_debug_wdl_compare(rq->cpu, wdl, p->dl.deadline, get_big_deadline(rq, NULL), get_little_next(rq), rq->rd->little_next);
+	}
 
 	trace_uscedf_wdl_check_end(rq);
 
@@ -799,6 +821,8 @@ static int push_wdl_stop(void *arg)
 		!dl_time_before(p->dl.deadline, dst_rq->dl.earliest_dl.curr))
 		goto push_wdl_unlock;
 	
+	trace_uscedf_debug_wdl_push(this_cpu, p);
+
 	deactivate_task(this_rq, p, 0);
 	set_task_cpu(p, dst_rq->cpu);
 	activate_task(dst_rq, p, 0);
@@ -993,13 +1017,17 @@ static void _update_bl_deadline(struct root_domain *rd, int big)
 {
 	int cpu, latest_cpu = -1;
 	cpumask_var_t *iter_mask;
-	//deadline of 0 stands for idle, earliest deadline possible is 1
-	u64 latest = 1;
+	u64 latest = 0;
+	u64 old;
 
-	if (big)
+	if (big) {
 		iter_mask = &rd->big_online;
-	else
+		old = rd->big_deadline;
+	}
+	else {
 		iter_mask = &rd->little_online;
+		old = rd->little_deadline;
+	}
 
 	for_each_cpu(cpu, *iter_mask) {
 		u64 cpu_curr_dl = cpu_rq(cpu)->dl.earliest_dl.curr;
@@ -1021,6 +1049,10 @@ static void _update_bl_deadline(struct root_domain *rd, int big)
 	else {
 		rd->little_deadline = latest;
 		rd->little_deadline_cpu = latest_cpu;
+	}
+
+	if (old != latest) {
+		trace_uscedf_debug_bl_deadline_updated(rd);
 	}
 }
 
@@ -1058,12 +1090,12 @@ static int _update_bl_next(struct root_domain *rd, int big)
 
 	for_each_cpu(cpu, *iter_next) {
 		u64 next = cpu_rq(cpu)->dl.earliest_dl.next;
-		if (!earliest || dl_time_before(next, earliest))
+		if (!earliest || (next && dl_time_before(next, earliest)))
 			earliest = next;
 	}
 	for_each_cpu(cpu, *iter_global) {
 		u64 next_global = cpu_rq(cpu)->dl.earliest_dl.next_global;
-		if (!earliest || dl_time_before(next_global, earliest))
+		if (!earliest || (next_global && dl_time_before(next_global, earliest)))
 			earliest = next_global;
 	}
 
@@ -1071,6 +1103,10 @@ static int _update_bl_next(struct root_domain *rd, int big)
 		rd->big_next = earliest;
 	else
 		rd->little_next = earliest;
+
+	if (old != earliest) {
+		trace_uscedf_debug_bl_next_updated(rd);
+	}
 	
 	return old != earliest;
 }
@@ -1086,11 +1122,13 @@ static void update_edl_next(struct rq *rq, u64 new_next)
 	updated = _update_bl_next(rq->rd, big);
 	raw_spin_unlock_irqrestore(&rq->rd->dl_bl_lock, flags);
 
+	trace_uscedf_debug_rq_next_updated(rq, 0);
+
 	if (updated) {
 		cpumask_var_t *iter_mask = big? &rq->rd->big_online: &rq->rd->little_online;
 		for_each_cpu(cpu, *iter_mask) {
 			struct rq *iter_rq = cpu_rq(cpu);
-			if (rq != iter_rq && iter_rq->dl.earliest_dl.curr_is_global)
+			if (iter_rq->dl.earliest_dl.curr_is_global)
 				resched_curr(iter_rq);
 		}
 	}
@@ -1106,6 +1144,8 @@ static void update_edl_next_global(struct rq *rq, u64 new_next_global)
 	rq->dl.earliest_dl.next_global = new_next_global;
 	updated = _update_bl_next(rq->rd, big);
 	raw_spin_unlock_irqrestore(&rq->rd->dl_bl_lock, flags);
+
+	trace_uscedf_debug_rq_next_updated(rq, 1);
 
 	if (updated) {
 		cpumask_var_t *iter_mask = big? &rq->rd->big_online: &rq->rd->little_online;
@@ -1322,7 +1362,7 @@ static struct rq *dl_task_offline_migration(struct rq *rq, struct task_struct *p
 	dl_b = &later_rq->rd->dl_bw;
 	raw_spin_lock(&dl_b->lock);
 	__populate_bw_info(later_rq->rd, &bws, p->dl.dl_bw, __task_dl_aff(p));
-	__dl_add_bws(dl_b, &bws, cpumask_weight(later_rq->rd->span));
+	__dl_add_bws(dl_b, &bws, cpumask_weight(later_rq->rd->span), p->dl.dl_period);
 	raw_spin_unlock(&dl_b->lock);
 
 	set_task_cpu(p, later_rq->cpu);
@@ -1955,6 +1995,8 @@ static void update_curr_dl(struct rq *rq)
 		unsigned long scale_freq = arch_scale_freq_capacity(cpu);
 		unsigned long scale_cpu = arch_scale_cpu_capacity(cpu);
 
+		WARN_ONCE(scale_freq != SCHED_CAPACITY_SCALE, "CPU %d scaling frequency", cpu);
+
 		scaled_delta_exec = cap_scale(delta_exec, scale_freq);
 		scaled_delta_exec = cap_scale(scaled_delta_exec, scale_cpu);
 	}
@@ -2354,6 +2396,7 @@ static void enqueue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 
 	trace_uscedf_enqueue_start(p);
 	enqueue_dl_entity(&p->dl, flags);
+	trace_uscedf_debug_rq_enqueued(rq, p);
 
 	if (!task_current(rq, p) && p->nr_cpus_allowed > 1)
 		enqueue_pushable_dl_task(rq, p);
@@ -2364,6 +2407,7 @@ static void __dequeue_task_dl(struct rq *rq, struct task_struct *p, int flags)
 {
 	update_stats_dequeue_dl(&rq->dl, &p->dl, flags);
 	trace_uscedf_dequeue_start(p);
+	trace_uscedf_debug_rq_dequeued(rq, p);
 	dequeue_dl_entity(&p->dl);
 	dequeue_pushable_dl_task(rq, p);
 	trace_uscedf_dequeue_end(p);
@@ -3281,7 +3325,7 @@ void dl_add_task_root_domain(struct task_struct *p)
 	raw_spin_lock(&dl_b->lock);
 
 	__populate_bw_info(rq->rd, &bws, p->dl.dl_bw, __task_dl_aff(p));
-	__dl_add_bws(dl_b, &bws, cpumask_weight(rq->rd->span));
+	__dl_add_bws(dl_b, &bws, cpumask_weight(rq->rd->span), p->dl.dl_period);
 
 	raw_spin_unlock(&dl_b->lock);
 
@@ -3590,7 +3634,7 @@ int sched_dl_overflow(struct task_struct *p, int policy,
 	    !__dl_overflow(rd, &delta)) {
 		if (hrtimer_active(&p->dl.inactive_timer))
 			__dl_sub_bws(dl_b, &old, cpus);
-		__dl_add_bws(dl_b, &new, cpus);
+		__dl_add_bws(dl_b, &new, cpus, period);
 		err = 0;
 	} else if (dl_policy(policy) && task_has_dl_policy(p) &&
 		   !__dl_overflow(rd, &delta)) {
@@ -3602,7 +3646,7 @@ int sched_dl_overflow(struct task_struct *p, int policy,
 		 * timer" when the task is not inactive.
 		 */
 		__dl_sub_bws(dl_b, &old, cpus);
-		__dl_add_bws(dl_b, &new, cpus);
+		__dl_add_bws(dl_b, &new, cpus, period);
 		dl_change_utilization(p, new_bw);
 		err = 0;
 	} else if (!dl_policy(policy) && task_has_dl_policy(p)) {
